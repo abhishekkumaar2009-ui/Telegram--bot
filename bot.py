@@ -1,5 +1,8 @@
+import os
+import asyncio
 import logging
 import httpx
+from aiohttp import web
 from telegram import Update
 from telegram.constants import ChatAction
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
@@ -11,13 +14,12 @@ logging.basicConfig(
 
 BOT_TOKEN = "8929514969:AAFTY3B5dughEyhsYzxPbSPaYnIT2HdzAsc"
 API_BASE_URL = "https://sra-cybertech-pvt-ltd-api-gateway.duckdns.org/Num-info?key=SRA-DAFA2D237CD6DE96&mobile="
-
 FOOTER_TEXT = "\n━━━━━━━━━━━━━━━━━━━━\n<b>Created by - Abhishek ( @abhisxhxz)</b>"
 
 http_client = httpx.AsyncClient(timeout=15.0)
 
 def get_emoji(key):
-    k = key.lower()
+    k = str(key).lower()
     if any(x in k for x in ["name", "fname", "full_name"]) and "father" not in k:
         return "👤"
     if "father" in k:
@@ -85,7 +87,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     target_number = digits_only[-10:]
-
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
 
     try:
@@ -118,7 +119,36 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         await update.message.reply_text(reply)
 
-if __name__ == '__main__':
+# Render port keep-alive server
+async def handle_health_check(request):
+    return web.Response(text="Bot is running active 24/7!")
+
+async def start_web_server():
+    server = web.Application()
+    server.router.add_get('/', handle_health_check)
+    runner = web.AppRunner(server)
+    await runner.setup()
+    port = int(os.environ.get("PORT", 8080))
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+
+# Automatic keep-alive self pinger
+async def keep_alive_ping():
+    render_url = os.environ.get("RENDER_EXTERNAL_URL")
+    if not render_url:
+        return
+    while True:
+        await asyncio.sleep(600)  # Har 10 minute me server ko jagaye rakhega
+        try:
+            await http_client.get(render_url)
+            logging.info("Keep-alive self ping successful!")
+        except Exception as e:
+            logging.warning(f"Self-ping failed: {e}")
+
+async def main():
+    await start_web_server()
+    asyncio.create_task(keep_alive_ping())
+
     app = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
@@ -129,5 +159,14 @@ if __name__ == '__main__':
     )
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
-    print("Bot start ho gaya hai...")
-    app.run_polling(drop_pending_updates=True)
+    
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling(drop_pending_updates=True)
+    
+    while True:
+        await asyncio.sleep(3600)
+
+if __name__ == '__main__':
+    asyncio.run(main())
+                            
