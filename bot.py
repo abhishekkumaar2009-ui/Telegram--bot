@@ -1,4 +1,5 @@
 import os
+import json
 import asyncio
 import logging
 import httpx
@@ -21,17 +22,42 @@ logging.basicConfig(
 
 # --- CONFIGURATION ---
 BOT_TOKEN = "8929514969:AAFTY3B5dughEyhsYzxPbSPaYnIT2HdzAsc"
-API_BASE_URL = "https://sra-cybertech-pvt-ltd-api-gateway.duckdns.org/Num-info?key=SRA-DAFA2D237CD6DE96&mobile="
+API_NUM_INFO = "https://sra-cybertech-pvt-ltd-api-gateway.duckdns.org/Num-info?key=SRA-DAFA2D237CD6DE96&mobile="
+API_TG_NUM = "https://sra-cybertech-pvt-ltd-api-gateway.duckdns.org/Tg-num?key=SRA-C28967E03172EB18&lookup="
 
 CHANNEL_USERNAME = "@abhisxhxzoffer"
 CHANNEL_LINK = "https://t.me/abhisxhxzoffer"
 BOT_USERNAME = "@abhisxhxzinfo_bot"
 
+# Yahan apni numerical Telegram User ID daalein (/myid command chala kar check kar sakte hain):
+ADMIN_ID = 0  
+
 FOOTER_TEXT = "\n━━━━━━━━━━━━━━━━━━━━\n<b>Created by - Abhishek ( @abhisxhxz )</b>"
 
-http_client = httpx.AsyncClient(timeout=15.0)
+USERS_FILE = "users.json"
+http_client = httpx.AsyncClient(timeout=35.0, limits=httpx.Limits(max_keepalive_connections=20, max_connections=50))
 
-# Check user membership
+# --- USER PERSISTENCE ---
+def load_users():
+    if os.path.exists(USERS_FILE):
+        try:
+            with open(USERS_FILE, "r") as f:
+                return set(json.load(f))
+        except Exception:
+            return set()
+    return set()
+
+def save_user(user_id):
+    users = load_users()
+    if user_id not in users:
+        users.add(user_id)
+        try:
+            with open(USERS_FILE, "w") as f:
+                json.dump(list(users), f)
+        except Exception as e:
+            logging.error(f"Error saving user: {e}")
+
+# --- CHANNEL SUBSCRIPTION CHECK ---
 async def is_subscribed(bot, user_id):
     try:
         member = await bot.get_chat_member(chat_id=CHANNEL_USERNAME, user_id=user_id)
@@ -51,7 +77,39 @@ def get_join_keyboard():
     ]
     return InlineKeyboardMarkup(keyboard)
 
-# Short & Clean Data Formatter
+def get_main_menu_keyboard():
+    keyboard = [
+        [
+            InlineKeyboardButton("📱 Numb - Info", callback_data="mode_num_info"),
+            InlineKeyboardButton("🔎 Username - Number", callback_data="mode_tg_num"),
+        ]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+# --- STRICT KEY EXTRACTOR LOGIC ---
+def extract_field(flat_data, exact_keys, contains_keys=None, exclude_words=None):
+    if contains_keys is None:
+        contains_keys = []
+    if exclude_words is None:
+        exclude_words = []
+
+    # 1. Exact match priority
+    for k in exact_keys:
+        if k in flat_data:
+            val = flat_data[k]
+            if val and val.lower() not in ["none", "null", "", "false", "undefined"]:
+                return val
+
+    # 2. Contains match with negative filters
+    for k, v in flat_data.items():
+        if any(exc in k for exc in exclude_words):
+            continue
+        if any(c in k for c in contains_keys):
+            if v and v.lower() not in ["none", "null", "", "false", "undefined"]:
+                return v
+
+    return None
+
 def format_clean_details(data):
     if isinstance(data, list):
         if len(data) == 0:
@@ -75,62 +133,114 @@ def format_clean_details(data):
                 flat_data[str(k).lower().strip()] = str(v).strip() if v is not None else ""
     flatten(data)
 
-    def find_val(keywords):
-        for k, v in flat_data.items():
-            if any(kw == k or kw in k for kw in keywords):
-                if v and v.lower() not in ["none", "null", "", "false", "undefined"]:
-                    return v
-        return None
+    name = extract_field(
+        flat_data,
+        exact_keys=["name", "full_name", "fname", "customer_name", "c_name"],
+        contains_keys=["name"],
+        exclude_words=["father", "care_of", "co", "relative", "guardian"]
+    )
 
-    name = find_val(["full_name", "fname", "name", "customer_name"])
-    father = find_val(["father_name", "father", "fname_father", "care_of"])
-    mobile = find_val(["mobile", "phone", "number", "num"])
-    address = find_val(["address", "addr", "permanent_address", "city", "location"])
-    email = find_val(["email", "mail"])
-    sim = find_val(["operator", "carrier", "sim", "telecom", "circle"])
-    dob = find_val(["dob", "date_of_birth", "birth"])
-    uid = find_val(["aadhaar", "uid", "pan", "id"])
+    father = extract_field(
+        flat_data,
+        exact_keys=["father_name", "father", "fname_father", "care_of", "f_name", "guardian"],
+        contains_keys=["father", "care_of", "guardian"],
+        exclude_words=[]
+    )
+
+    mobile = extract_field(
+        flat_data,
+        exact_keys=["mobile", "phone", "number", "num", "mobile_no"],
+        contains_keys=["mobile", "phone"],
+        exclude_words=[]
+    )
+
+    address = extract_field(
+        flat_data,
+        exact_keys=["address", "addr", "permanent_address", "local_address", "location"],
+        contains_keys=["address", "addr"],
+        exclude_words=[]
+    )
+
+    email = extract_field(
+        flat_data,
+        exact_keys=["email", "mail", "email_id"],
+        contains_keys=["email", "mail"],
+        exclude_words=[]
+    )
+
+    sim = extract_field(
+        flat_data,
+        exact_keys=["operator", "carrier", "sim", "telecom", "circle"],
+        contains_keys=["operator", "carrier", "circle"],
+        exclude_words=[]
+    )
+
+    dob = extract_field(
+        flat_data,
+        exact_keys=["dob", "date_of_birth", "birth_date"],
+        contains_keys=["dob", "birth"],
+        exclude_words=[]
+    )
+
+    uid = extract_field(
+        flat_data,
+        exact_keys=["id", "uid", "aadhaar", "aadhar", "pan", "id_number", "card_no", "identity"],
+        contains_keys=["aadhaar", "aadhar", "uid", "id_number", "card_no"],
+        exclude_words=[]
+    )
 
     lines = ["⚡ <b>Details Fetched by Abhishek</b>\n"]
 
     if name:
-        lines.append(f"👤 <b>Name:</b> {name}")
+        lines.append(f"👤 <b>Name:</b> <code>{name}</code>")
     if father:
-        lines.append(f"👨‍👦 <b>Father:</b> {father}")
+        lines.append(f"👨‍👦 <b>Father:</b> <code>{father}</code>")
     if mobile:
-        lines.append(f"📞 <b>Mobile:</b> {mobile}")
+        lines.append(f"📞 <b>Mobile:</b> <code>{mobile}</code>")
     if address:
-        lines.append(f"🏠 <b>Address:</b> {address}")
+        lines.append(f"🏠 <b>Address:</b> <code>{address}</code>")
     if email:
-        lines.append(f"📧 <b>Email:</b> {email}")
+        lines.append(f"📧 <b>Email:</b> <code>{email}</code>")
     if sim:
-        lines.append(f"📡 <b>SIM/Circle:</b> {sim}")
+        lines.append(f"📡 <b>SIM/Circle:</b> <code>{sim}</code>")
     if dob:
-        lines.append(f"📅 <b>DOB:</b> {dob}")
+        lines.append(f"📅 <b>DOB:</b> <code>{dob}</code>")
     if uid:
-        lines.append(f"🪪 <b>ID:</b> {uid}")
+        lines.append(f"🪪 <b>ID/Aadhaar:</b> <code>{uid}</code>")
 
-    # Agar koi main field nahi mili toh baaki keys check karo
     if len(lines) == 1:
         for k, v in flat_data.items():
             if v and k not in ["status", "success", "response_code", "message"] and v.lower() not in ["none", "null", ""]:
-                lines.append(f"🔹 <b>{k.title()}:</b> {v}")
+                lines.append(f"🔹 <b>{k.title()}:</b> <code>{v}</code>")
 
-    # Agar abhi bhi koi valid data nahi mila
     if len(lines) == 1:
         return None
 
     return "\n".join(lines)
 
+async def fetch_api_with_retry(url, retries=2):
+    for attempt in range(retries):
+        try:
+            response = await http_client.get(url)
+            return response
+        except (httpx.TimeoutException, httpx.NetworkError):
+            if attempt == retries - 1:
+                raise
+            await asyncio.sleep(1.5)
+    return None
+
+# --- COMMAND HANDLERS ---
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    save_user(user.id)
     joined = await is_subscribed(context.bot, user.id)
 
     if not joined:
         text = (
             f"👋 <b>Namaste {user.first_name}!</b>\n\n"
             "⚠️ <b>Access Restricted!</b>\n"
-            "Bot use karne ke liye pehle hamara channel join karna hoga.\n\n"
+            "Bot use karne ke liye pehle hamara channel join karein.\n\n"
             "Niche button par click karke channel join karein, fir <b>'Joined / Verify'</b> dabayein."
         )
         await update.message.reply_text(text, reply_markup=get_join_keyboard(), parse_mode="HTML")
@@ -138,50 +248,185 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     welcome_msg = (
         f"👋 <b>Namaste {user.first_name}!</b>\n\n"
-        "✅ <b>Access Verified!</b>\n"
-        "🔎 Mujhe koi bhi 10-digit mobile number bhejein details pane ke liye."
+        "✅ <b>Access Verified!</b>\n\n"
+        "Niche diye gaye options me se select karein ki aap kya check karna chahte hain 👇"
         f"{FOOTER_TEXT}"
     )
-    await update.message.reply_text(welcome_msg, parse_mode="HTML")
+    await update.message.reply_text(welcome_msg, reply_markup=get_main_menu_keyboard(), parse_mode="HTML")
 
-async def verify_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    await update.message.reply_text(f"🆔 <b>Aapki Telegram User ID:</b> <code>{user_id}</code>", parse_mode="HTML")
+
+async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    
+    if ADMIN_ID == 0 or user_id != ADMIN_ID:
+        await update.message.reply_text("⛔ <b>Access Denied!</b> Sirf bot owner hi broadcast kar sakta hai.", parse_mode="HTML")
+        return
+
+    if not context.args:
+        await update.message.reply_text("⚠️ <b>Format:</b> <code>/broadcast Aapka message yahan likhein</code>", parse_mode="HTML")
+        return
+
+    msg_to_send = " ".join(context.args)
+    users = load_users()
+    total = len(users)
+    success = 0
+    failed = 0
+
+    status_msg = await update.message.reply_text(f"⏳ Broadcasting to {total} users...")
+
+    for uid in users:
+        try:
+            await context.bot.send_message(chat_id=uid, text=msg_to_send, parse_mode="HTML")
+            success += 1
+            await asyncio.sleep(0.05)
+        except Exception:
+            failed += 1
+
+    await status_msg.edit_text(
+        f"📢 <b>Broadcast Complete!</b>\n\n"
+        f"👥 Total Users: {total}\n"
+        f"✅ Sent: {success}\n"
+        f"❌ Failed (Blocked): {failed}",
+        parse_mode="HTML"
+    )
+
+# --- CALLBACK HANDLERS ---
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = query.from_user.id
-    joined = await is_subscribed(context.bot, user_id)
+    data = query.data
 
-    if joined:
-        await query.answer("✅ Verification Successful! Access unlock ho gaya.", show_alert=True)
-        welcome_msg = (
-            f"🎉 <b>Swagat hai {query.from_user.first_name}!</b>\n\n"
-            "🔎 Ab aap koi bhi 10-digit mobile number send kar sakte hain."
-            f"{FOOTER_TEXT}"
+    if data == "check_join":
+        joined = await is_subscribed(context.bot, user_id)
+        if joined:
+            save_user(user_id)
+            await query.answer("✅ Verification Successful! Access unlock ho gaya.", show_alert=True)
+            welcome_msg = (
+                f"🎉 <b>Swagat hai {query.from_user.first_name}!</b>\n\n"
+                "Niche diye gaye options me se chunein 👇"
+                f"{FOOTER_TEXT}"
+            )
+            await query.edit_message_text(welcome_msg, reply_markup=get_main_menu_keyboard(), parse_mode="HTML")
+        else:
+            await query.answer("❌ Aapne abhi tak channel join nahi kiya! Kripya pehle join karein.", show_alert=True)
+
+    elif data == "mode_num_info":
+        context.user_data["mode"] = "num_info"
+        await query.answer()
+        await query.message.reply_text(
+            "📱 <b>Numb - Info Selected</b>\n\n"
+            "Kripya kisi bhi vyakti ka <b>10-digit mobile number</b> bhejein details pane ke liye:",
+            parse_mode="HTML"
         )
-        await query.edit_message_text(welcome_msg, parse_mode="HTML")
-    else:
-        await query.answer("❌ Aapne abhi tak channel join nahi kiya! Kripya pehle join karein.", show_alert=True)
+
+    elif data == "mode_tg_num":
+        context.user_data["mode"] = "tg_num"
+        await query.answer()
+        await query.message.reply_text(
+            "🔎 <b>Username - Number Selected</b>\n\n"
+            "Kripya Telegram user ka <b>@username</b> bhejein (jaise: <code>@username</code> ya <code>username</code>):",
+            parse_mode="HTML"
+        )
+
+# --- MESSAGE PROCESSING HANDLER ---
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    joined = await is_subscribed(context.bot, user_id)
+    save_user(user_id)
 
+    joined = await is_subscribed(context.bot, user_id)
     if not joined:
-        text = "⚠️ <b>Access Restricted!</b>\n\nNumber search karne ke liye pehle channel join karna hoga."
+        text = "⚠️ <b>Access Restricted!</b>\n\nBot use karne ke liye pehle hamara channel join karein."
         await update.message.reply_text(text, reply_markup=get_join_keyboard(), parse_mode="HTML")
         return
 
     text = update.message.text.strip()
-    digits_only = "".join(filter(str.isdigit, text))
+    mode = context.user_data.get("mode")
 
+    # 1. USERNAME TO NUMBER LOOKUP
+    if mode == "tg_num" or text.startswith("@") or (not text.isdigit() and len(text) > 3):
+        clean_user = text.lstrip("@").strip()
+        
+        status_msg = await update.message.reply_text(
+            "⏳ <i>Fetching number from Telegram Database... Thoda samay lag sakta hai...</i>",
+            parse_mode="HTML"
+        )
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+
+        try:
+            url = f"{API_TG_NUM}{clean_user}"
+            response = await fetch_api_with_retry(url, retries=2)
+            
+            raw_data = None
+            try:
+                raw_data = response.json()
+            except Exception:
+                raw_data = response.text
+
+            found_number = None
+            if isinstance(raw_data, dict):
+                found_number = extract_field(
+                    raw_data,
+                    exact_keys=["phone", "mobile", "number", "num", "phone_number"],
+                    contains_keys=["phone", "mobile", "num"]
+                )
+            elif isinstance(raw_data, str) and any(c.isdigit() for c in raw_data):
+                found_number = "".join(filter(str.isdigit, raw_data))
+
+            if found_number:
+                reply = (
+                    "🎯 <b>TELEGRAM NUMBER FOUND:</b>\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n\n"
+                    f"🏷 <b>Username:</b> <code>@{clean_user}</code>\n"
+                    f"📞 <b>Mobile Number:</b> <code>{found_number}</code>\n\n"
+                    "<i>Tip: Aap is number ko 'Numb - Info' me check karke poori details nikaal sakte hain.</i>\n"
+                    f"{FOOTER_TEXT}"
+                )
+            else:
+                reply = (
+                    f"❌ <b>Username <code>@{clean_user}</code> ka number nahi mila.</b>\n\n"
+                    "Ho sakta hai account private ho ya database me updated na ho."
+                    f"{FOOTER_TEXT}"
+                )
+
+        except (httpx.TimeoutException, httpx.NetworkError):
+            reply = (
+                "⏱️ <b>Server Response Timeout!</b>\n"
+                "API server response dene me zyada samay le raha hai. Kripya 1 minute baad dobara try karein."
+                f"{FOOTER_TEXT}"
+            )
+        except Exception as e:
+            reply = f"❌ Error: <code>{str(e)}</code>{FOOTER_TEXT}"
+
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔙 Main Menu", callback_data="check_join")]
+        ])
+        try:
+            await status_msg.edit_text(reply, reply_markup=keyboard, parse_mode="HTML")
+        except Exception:
+            await update.message.reply_text(reply, reply_markup=keyboard, parse_mode="HTML")
+        return
+
+    # 2. NUMBER TO INFO LOOKUP
+    digits_only = "".join(filter(str.isdigit, text))
     if len(digits_only) < 10:
-        await update.message.reply_text("❌ Kripya sahi 10-digit number enter karein.")
+        await update.message.reply_text(
+            "⚠️ Kripya sahi 10-digit mobile number bhejien ya menu se option select karein.",
+            reply_markup=get_main_menu_keyboard()
+        )
         return
 
     target_number = digits_only[-10:]
+    status_msg = await update.message.reply_text("🔍 <i>Searching in Database... Please wait...</i>", parse_mode="HTML")
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
 
     try:
-        url = f"{API_BASE_URL}{target_number}"
-        response = await http_client.get(url)
+        url = f"{API_NUM_INFO}{target_number}"
+        response = await fetch_api_with_retry(url, retries=2)
         formatted_info = None
 
         try:
@@ -192,7 +437,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if raw_text and "not found" not in raw_text.lower():
                 formatted_info = raw_text
 
-        # Jab number ki koi details na mile
         if not formatted_info:
             reply = (
                 f"❌ <b>Is number (<code>{target_number}</code>) ki koi jankari nahi mili.</b>\n"
@@ -202,17 +446,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             reply = f"{formatted_info}\n{FOOTER_TEXT}"
 
-    except httpx.TimeoutException:
+    except (httpx.TimeoutException, httpx.NetworkError):
         reply = f"⏱️ Request timeout. Thodi der baad dobara koshish karein.{FOOTER_TEXT}"
     except Exception as e:
         reply = f"❌ Error: <code>{str(e)}</code>{FOOTER_TEXT}"
 
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔙 Main Menu", callback_data="check_join")]
+    ])
     try:
-        await update.message.reply_text(reply, parse_mode="HTML")
+        await status_msg.edit_text(reply, reply_markup=keyboard, parse_mode="HTML")
     except Exception:
-        await update.message.reply_text(reply)
+        await update.message.reply_text(reply, reply_markup=keyboard, parse_mode="HTML")
 
-# Render dummy web server
+# --- RENDER WEB SERVER ---
 async def handle_health_check(request):
     return web.Response(text="Bot is running active 24/7!")
 
@@ -225,13 +472,13 @@ async def start_web_server():
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
 
-# Automatic keep-alive self pinger
+# --- KEEP-ALIVE SELF PINGER ---
 async def keep_alive_ping():
     render_url = os.environ.get("RENDER_EXTERNAL_URL")
     if not render_url:
         return
     while True:
-        await asyncio.sleep(600)  # Har 10 minute me ping karega
+        await asyncio.sleep(600)
         try:
             await http_client.get(render_url)
             logging.info("Keep-alive self ping successful!")
@@ -245,13 +492,15 @@ async def main():
     app = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
-        .connect_timeout(30.0)
-        .read_timeout(30.0)
-        .write_timeout(30.0)
+        .connect_timeout(35.0)
+        .read_timeout(35.0)
+        .write_timeout(35.0)
         .build()
     )
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(verify_callback, pattern="^check_join$"))
+    app.add_handler(CommandHandler("myid", myid))
+    app.add_handler(CommandHandler("broadcast", broadcast))
+    app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
 
     await app.initialize()
@@ -263,4 +512,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-    
