@@ -1,18 +1,21 @@
 import os
-import json
 import asyncio
 import logging
-import re
-import urllib.parse
+import sqlite3
+from datetime import date
 import httpx
 from aiohttp import web
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.constants import ChatAction, ChatMemberStatus
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
+from telegram.constants import ChatAction
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
-    MessageHandler,
     CallbackQueryHandler,
+    MessageHandler,
     filters,
     ContextTypes,
 )
@@ -22,483 +25,336 @@ logging.basicConfig(
     level=logging.INFO,
 )
 
-# --- CONFIGURATION ---
-BOT_TOKEN = "8929514969:AAFTY3B5dughEyhsYzxPbSPaYnIT2HdzAsc"
-API_NUM_INFO = "https://sra-cybertech-pvt-ltd-api-gateway.duckdns.org/Num-info?key=SRA-DAFA2D237CD6DE96&mobile="
-API_TG_NUM = "https://sra-cybertech-pvt-ltd-api-gateway.duckdns.org/Tg-num?key=SRA-C28967E03172EB18&lookup="
+# --- BOT CONFIGURATION ---
+BOT_TOKEN = "8056463990:AAGoV71k_sH8W5jH2vVfJ8Lw8Z7Z8Z8Z8Z8"  # Apna Info Bot Token
+ADMIN_ID = 6878347712
 
-CHANNEL_USERNAME = "@abhisxhxzoffer"
-CHANNEL_LINK = "https://t.me/abhisxhxzoffer"
-BOT_USERNAME = "@abhisxhxzinfo_bot"
+FOOTER_TEXT = "\n\n━━━━━━━━━━━━━━━━━━━━\nCreated by - Abhishek ( @abhisxhxz )"
 
-# Yahan apni numerical Telegram User ID daalein (/myid command se):
-ADMIN_ID = 0  
+http_client = httpx.AsyncClient(timeout=45.0)
+USER_STATES = {}
 
-FOOTER_TEXT = "\n━━━━━━━━━━━━━━━━━━━━\n<b>Created by - Abhishek ( @abhisxhxz )</b>"
+# --- DATABASE SETUP ---
+DB_FILE = "users_data.db"
 
-USERS_FILE = "users.json"
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            credits INTEGER DEFAULT 5,
+            last_date TEXT,
+            referred_by INTEGER
+        )
+    """)
+    conn.commit()
+    conn.close()
 
-# Realistic headers to bypass server firewalls
-CUSTOM_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Linux; Android 13; SM-S908B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,application/json,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Connection": "keep-alive",
-}
+init_db()
 
-http_client = httpx.AsyncClient(
-    timeout=45.0,
-    verify=False,
-    headers=CUSTOM_HEADERS,
-    follow_redirects=True,
-    limits=httpx.Limits(max_keepalive_connections=20, max_connections=50)
-)
+def get_user_credits(user_id):
+    today_str = str(date.today())
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT credits, last_date FROM users WHERE user_id = ?", (user_id,))
+    row = c.fetchone()
 
-# --- USER PERSISTENCE ---
-def load_users():
-    if os.path.exists(USERS_FILE):
-        try:
-            with open(USERS_FILE, "r") as f:
-                return set(json.load(f))
-        except Exception:
-            return set()
-    return set()
+    if not row:
+        c.execute("INSERT INTO users (user_id, credits, last_date) VALUES (?, 5, ?)", (user_id, today_str))
+        conn.commit()
+        conn.close()
+        return 5
+    else:
+        credits, last_date = row
+        # Daily reset agar new day ho gaya hai
+        if last_date != today_str:
+            credits = 5
+            c.execute("UPDATE users SET credits = ?, last_date = ? WHERE user_id = ?", (credits, today_str, user_id))
+            conn.commit()
+        conn.close()
+        return credits
 
-def save_user(user_id):
-    users = load_users()
-    if user_id not in users:
-        users.add(user_id)
-        try:
-            with open(USERS_FILE, "w") as f:
-                json.dump(list(users), f)
-        except Exception as e:
-            logging.error(f"Error saving user: {e}")
+def deduct_credit(user_id):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("UPDATE users SET credits = credits - 1 WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
 
-# --- CHANNEL SUBSCRIPTION CHECK ---
-async def is_subscribed(bot, user_id):
-    try:
-        member = await bot.get_chat_member(chat_id=CHANNEL_USERNAME, user_id=user_id)
-        return member.status in [
-            ChatMemberStatus.MEMBER,
-            ChatMemberStatus.ADMINISTRATOR,
-            ChatMemberStatus.OWNER,
-        ]
-    except Exception as e:
-        logging.warning(f"Subscription check error: {e}")
-        return False
+def add_referral_credits(referrer_id):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("UPDATE users SET credits = credits + 5 WHERE user_id = ?", (referrer_id,))
+    conn.commit()
+    conn.close()
 
-def get_join_keyboard():
-    keyboard = [
-        [InlineKeyboardButton("📢 Join Channel", url=CHANNEL_LINK)],
-        [InlineKeyboardButton("✅ Verify", callback_data="check_join")],
-    ]
-    return InlineKeyboardMarkup(keyboard)
-
-# Compact, Clean Layout
-def get_main_menu_keyboard():
+# --- KEYBOARDS ---
+def get_main_menu():
     keyboard = [
         [
-            InlineKeyboardButton("📱 Num Info", callback_data="mode_num_info"),
-            InlineKeyboardButton("🔎 User to Num", callback_data="mode_tg_num"),
+            InlineKeyboardButton("🔍 Num Info", callback_data="num_info"),
+            InlineKeyboardButton("👤 User to Num", callback_data="user_to_num"),
+        ],
+        [
+            InlineKeyboardButton("🎁 Refer & Earn", callback_data="refer_earn"),
+            InlineKeyboardButton("💳 My Credits", callback_data="my_credits"),
+        ],
+        [
+            InlineKeyboardButton("👑 Owner", url="https://t.me/abhisxhxz"),
         ]
     ]
     return InlineKeyboardMarkup(keyboard)
 
-# Deep Flattening for Dicts & Lists
-def flatten_data(data):
-    flat = {}
-    def _flatten(obj, prefix=""):
-        if isinstance(obj, dict):
-            for k, v in obj.items():
-                _flatten(v, f"{prefix}{k}_")
-        elif isinstance(obj, list):
-            for idx, item in enumerate(obj):
-                _flatten(item, f"{prefix}{idx}_")
-        else:
-            clean_k = prefix.rstrip("_").lower().strip()
-            if obj is not None and str(obj).strip() != "":
-                flat[clean_k] = str(obj).strip()
-    _flatten(data)
-    return flat
-
-# Strict Field Extractor for Num-Info
-def extract_field(flat_data, exact_keys, contains_keys=None, exclude_words=None):
-    if contains_keys is None:
-        contains_keys = []
-    if exclude_words is None:
-        exclude_words = []
-
-    for k in exact_keys:
-        if k in flat_data:
-            val = flat_data[k]
-            if val and val.lower() not in ["none", "null", "", "false", "undefined"]:
-                return val
-
-    for k, v in flat_data.items():
-        if any(exc in k for exc in exclude_words):
-            continue
-        if any(c in k for c in contains_keys):
-            if v and v.lower() not in ["none", "null", "", "false", "undefined"]:
-                return v
-
-    return None
-
-def format_clean_details(data):
-    if not isinstance(data, (dict, list)):
-        text_data = str(data).strip()
-        if not text_data or "not found" in text_data.lower() or "no data" in text_data.lower():
-            return None
-        return text_data
-
-    flat_data = flatten_data(data)
-
-    name = extract_field(
-        flat_data,
-        exact_keys=["name", "full_name", "fname", "customer_name", "c_name"],
-        contains_keys=["name"],
-        exclude_words=["father", "care_of", "co", "relative", "guardian"]
+def get_back_button():
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("🔙 Back to Menu", callback_data="back_home")]]
     )
 
-    father = extract_field(
-        flat_data,
-        exact_keys=["father_name", "father", "fname_father", "care_of", "f_name", "guardian"],
-        contains_keys=["father", "care_of", "guardian"],
-        exclude_words=[]
-    )
-
-    mobile = extract_field(
-        flat_data,
-        exact_keys=["mobile", "phone", "number", "num", "mobile_no"],
-        contains_keys=["mobile", "phone"],
-        exclude_words=[]
-    )
-
-    address = extract_field(
-        flat_data,
-        exact_keys=["address", "addr", "permanent_address", "local_address", "location"],
-        contains_keys=["address", "addr"],
-        exclude_words=[]
-    )
-
-    email = extract_field(
-        flat_data,
-        exact_keys=["email", "mail", "email_id"],
-        contains_keys=["email", "mail"],
-        exclude_words=[]
-    )
-
-    sim = extract_field(
-        flat_data,
-        exact_keys=["operator", "carrier", "sim", "telecom", "circle"],
-        contains_keys=["operator", "carrier", "circle"],
-        exclude_words=[]
-    )
-
-    dob = extract_field(
-        flat_data,
-        exact_keys=["dob", "date_of_birth", "birth_date"],
-        contains_keys=["dob", "birth"],
-        exclude_words=[]
-    )
-
-    uid = extract_field(
-        flat_data,
-        exact_keys=["id", "uid", "aadhaar", "aadhar", "pan", "id_number", "card_no", "identity"],
-        contains_keys=["aadhaar", "aadhar", "uid", "id_number", "card_no"],
-        exclude_words=[]
-    )
-
-    lines = ["⚡ <b>Details Fetched by Abhishek</b>\n"]
-
-    if name:
-        lines.append(f"👤 <b>Name:</b> <code>{name}</code>")
-    if father:
-        lines.append(f"👨‍👦 <b>Father:</b> <code>{father}</code>")
-    if mobile:
-        lines.append(f"📞 <b>Mobile:</b> <code>{mobile}</code>")
-    if address:
-        lines.append(f"🏠 <b>Address:</b> <code>{address}</code>")
-    if email:
-        lines.append(f"📧 <b>Email:</b> <code>{email}</code>")
-    if sim:
-        lines.append(f"📡 <b>SIM/Circle:</b> <code>{sim}</code>")
-    if dob:
-        lines.append(f"📅 <b>DOB:</b> <code>{dob}</code>")
-    if uid:
-        lines.append(f"🪪 <b>ID/Aadhaar:</b> <code>{uid}</code>")
-
-    if len(lines) == 1:
-        for k, v in flat_data.items():
-            if v and k not in ["status", "success", "response_code", "message"] and v.lower() not in ["none", "null", ""]:
-                clean_header = k.split("_")[-1].title()
-                lines.append(f"🔹 <b>{clean_header}:</b> <code>{v}</code>")
-
-    if len(lines) == 1:
-        return None
-
-    return "\n".join(lines)
-
-# Advanced TG Phone Extractor
-def extract_tg_phone(raw_content):
-    if not raw_content:
-        return None, None
-
-    msg = None
-    # 1. If JSON
-    try:
-        data = json.loads(raw_content) if isinstance(raw_content, str) else raw_content
-        flat = flatten_data(data)
-        
-        for k, v in flat.items():
-            clean_val = str(v).strip()
-            digits = "".join(filter(str.isdigit, clean_val))
-            if any(key in k for key in ["phone", "mobile", "num", "contact", "number"]):
-                if 10 <= len(digits) <= 15:
-                    return digits, None
-            if any(key in k for key in ["msg", "message", "error", "reason", "status"]):
-                msg = clean_val
-
-        for k, v in flat.items():
-            digits = "".join(filter(str.isdigit, str(v)))
-            if 10 <= len(digits) <= 13:
-                return digits, None
-    except Exception:
-        pass
-
-    # 2. Text / Regex match
-    text_content = str(raw_content)
-    # Search phone numbers with optional + sign
-    matches = re.findall(r'(?:\+?\d{1,3}[- ]?)?\b\d{10,12}\b', text_content)
-    for m in matches:
-        digits = "".join(filter(str.isdigit, m))
-        if 10 <= len(digits) <= 15:
-            return digits, None
-
-    if "not found" in text_content.lower() or "no user" in text_content.lower():
-        msg = "User not registered in database"
-
-    return None, msg
-
-# Multi-Attempt Request with Fallback
-async def fetch_tg_num_safe(username):
-    queries = [username.lstrip("@"), f"@{username.lstrip('@')}"]
-    last_error = None
-
-    for q in queries:
-        encoded_query = urllib.parse.quote(q)
-        url = f"{API_TG_NUM}{encoded_query}"
-        try:
-            res = await http_client.get(url)
-            phone, msg = extract_tg_phone(res.text)
-            if phone:
-                return phone, None
-            if msg:
-                last_error = msg
-        except (httpx.TimeoutException, httpx.NetworkError) as e:
-            last_error = "Server Timeout"
-            await asyncio.sleep(1.0)
-        except Exception as e:
-            last_error = str(e)
-
-    return None, last_error
-
-# --- COMMAND HANDLERS ---
+# --- COMMANDS ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    save_user(user.id)
-    joined = await is_subscribed(context.bot, user.id)
+    user_id = user.id
+    today_str = str(date.today())
 
-    if not joined:
-        text = (
-            f"👋 <b>Namaste {user.first_name}!</b>\n\n"
-            "⚠️ <b>Access Restricted!</b>\n"
-            "Bot use karne ke liye pehle hamara channel join karein.\n\n"
-            "Niche button par tap karein, fir <b>Verify</b> dabayein."
-        )
-        await update.message.reply_text(text, reply_markup=get_join_keyboard(), parse_mode="HTML")
-        return
+    # Check Referral
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
+    existing_user = c.fetchone()
 
-    welcome_msg = (
-        f"👋 <b>Namaste {user.first_name}!</b>\n\n"
-        "✅ <b>Access Verified!</b>\n"
-        "Niche option select karein 👇"
+    if not existing_user and context.args:
+        arg = context.args[0]
+        if arg.startswith("ref_"):
+            try:
+                referrer_id = int(arg.replace("ref_", ""))
+                if referrer_id != user_id:
+                    # New user register with referrer
+                    c.execute("INSERT INTO users (user_id, credits, last_date, referred_by) VALUES (?, 5, ?, ?)", (user_id, today_str, referrer_id))
+                    conn.commit()
+                    add_referral_credits(referrer_id)
+
+                    try:
+                        await context.bot.send_message(
+                            chat_id=referrer_id,
+                            text=f"🎉 <b>New Referral!</b>\n\nUser <b>{user.first_name}</b> ne aapke link se join kiya!\nAapko <b>+5 Credits</b> mil gaye hain! 🎁",
+                            parse_mode="HTML"
+                        )
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+    conn.close()
+
+    credits = get_user_credits(user_id)
+
+    welcome_text = (
+        f"👋 Welcome <b>{user.first_name}</b>!\n\n"
+        "⚡ <b>Abhishek Info Bot</b> me aapka swagat hai.\n"
+        f"💳 <b>Aapke Credits:</b> <code>{credits}</code> searches bache hain (Daily 5 free).\n\n"
+        "Niche diye gaye buttons me se select karein:"
         f"{FOOTER_TEXT}"
     )
-    await update.message.reply_text(welcome_msg, reply_markup=get_main_menu_keyboard(), parse_mode="HTML")
 
-async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    await update.message.reply_text(f"🆔 <b>Telegram User ID:</b> <code>{user_id}</code>", parse_mode="HTML")
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.edit_message_text(
+            welcome_text, reply_markup=get_main_menu(), parse_mode="HTML"
+        )
+    else:
+        await update.message.reply_text(
+            welcome_text, reply_markup=get_main_menu(), parse_mode="HTML"
+        )
 
-async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    
-    if ADMIN_ID == 0 or user_id != ADMIN_ID:
-        await update.message.reply_text("⛔ <b>Access Denied!</b> Sirf owner broadcast kar sakta hai.", parse_mode="HTML")
-        return
-
-    if not context.args:
-        await update.message.reply_text("⚠️ Format: <code>/broadcast message</code>", parse_mode="HTML")
-        return
-
-    msg_to_send = " ".join(context.args)
-    users = load_users()
-    total = len(users)
-    success = 0
-    failed = 0
-
-    status_msg = await update.message.reply_text(f"⏳ Broadcasting to {total} users...")
-
-    for uid in users:
-        try:
-            await context.bot.send_message(chat_id=uid, text=msg_to_send, parse_mode="HTML")
-            success += 1
-            await asyncio.sleep(0.05)
-        except Exception:
-            failed += 1
-
-    await status_msg.edit_text(
-        f"📢 <b>Broadcast Complete!</b>\n\n"
-        f"👥 Total: {total} | ✅ Sent: {success} | ❌ Failed: {failed}",
-        parse_mode="HTML"
-    )
-
-# --- CALLBACK HANDLERS ---
-
-async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    user_id = query.from_user.id
+    await query.answer()
     data = query.data
+    user_id = update.effective_user.id
+    bot_info = await context.bot.get_me()
 
-    if data == "check_join":
-        joined = await is_subscribed(context.bot, user_id)
-        if joined:
-            save_user(user_id)
-            await query.answer("✅ Verified!", show_alert=True)
-            welcome_msg = (
-                f"🎉 <b>Swagat hai {query.from_user.first_name}!</b>\n\n"
-                "Niche option select karein 👇"
-                f"{FOOTER_TEXT}"
+    if data == "num_info":
+        if get_user_credits(user_id) <= 0:
+            await query.edit_message_text(
+                "❌ <b>Daily Limit Khatam!</b>\n\n"
+                "Aapke aaj ke 5 searches pure ho chuke hain.\n"
+                "Friends ko refer karein aur har refer par <b>+5 Credits</b> paayein!",
+                reply_markup=get_main_menu(),
+                parse_mode="HTML"
             )
-            await query.edit_message_text(welcome_msg, reply_markup=get_main_menu_keyboard(), parse_mode="HTML")
-        else:
-            await query.answer("❌ Pehle channel join karein!", show_alert=True)
+            return
 
-    elif data == "mode_num_info":
-        context.user_data["mode"] = "num_info"
-        await query.answer()
-        await query.message.reply_text(
-            "📱 <b>Num Info Mode</b>\n\nKisi bhi vyakti ka <b>10-digit mobile number</b> bhejein:",
+        USER_STATES[user_id] = "AWAITING_NUM"
+        await query.edit_message_text(
+            "📞 <b>Mobile Number Bhejo:</b>\n\n"
+            "Example: <code>9876543210</code>"
+            f"{FOOTER_TEXT}",
+            reply_markup=get_back_button(),
+            parse_mode="HTML",
+        )
+
+    elif data == "user_to_num":
+        if get_user_credits(user_id) <= 0:
+            await query.edit_message_text(
+                "❌ <b>Daily Limit Khatam!</b>\n\n"
+                "Aapke aaj ke 5 searches pure ho chuke hain.\n"
+                "Friends ko refer karein aur har refer par <b>+5 Credits</b> paayein!",
+                reply_markup=get_main_menu(),
+                parse_mode="HTML"
+            )
+            return
+
+        USER_STATES[user_id] = "AWAITING_USERNAME"
+        await query.edit_message_text(
+            "👤 <b>Telegram Username Bhejo:</b>\n\n"
+            "Example: <code>@abhisxhxz</code> ya <code>abhisxhxz</code>"
+            f"{FOOTER_TEXT}",
+            reply_markup=get_back_button(),
+            parse_mode="HTML",
+        )
+
+    elif data == "refer_earn":
+        ref_link = f"https://t.me/{bot_info.username}?start=ref_{user_id}"
+        await query.edit_message_text(
+            "🎁 <b>Refer & Earn Program:</b>\n\n"
+            "Apne dosto ko bot refer karo aur har referral par <b>5 extra credits</b> paao!\n\n"
+            f"🔗 <b>Aapka Unique Referral Link:</b>\n<code>{ref_link}</code>\n\n"
+            "<i>(Link par tap karke copy karein aur share karein)</i>"
+            f"{FOOTER_TEXT}",
+            reply_markup=get_back_button(),
             parse_mode="HTML"
         )
 
-    elif data == "mode_tg_num":
-        context.user_data["mode"] = "tg_num"
-        await query.answer()
-        await query.message.reply_text(
-            "🔎 <b>User to Num Mode</b>\n\nTelegram user ka <b>@username</b> bhejein (jaise: <code>@username</code> ya <code>username</code>):",
+    elif data == "my_credits":
+        credits = get_user_credits(user_id)
+        ref_link = f"https://t.me/{bot_info.username}?start=ref_{user_id}"
+        await query.edit_message_text(
+            "💳 <b>Aapka Account Status:</b>\n\n"
+            f"🔹 <b>Available Credits:</b> <code>{credits}</code> searches\n"
+            "🔹 <b>Daily Reset:</b> 5 Searches Har Din\n\n"
+            f"🔗 <b>Invite Link:</b>\n<code>{ref_link}</code>"
+            f"{FOOTER_TEXT}",
+            reply_markup=get_back_button(),
             parse_mode="HTML"
         )
 
-# --- MESSAGE HANDLER ---
+    elif data == "back_home":
+        USER_STATES[user_id] = None
+        await start(update, context)
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    save_user(user_id)
+    state = USER_STATES.get(user_id)
+    text = update.message.text.strip()
 
-    joined = await is_subscribed(context.bot, user_id)
-    if not joined:
-        text = "⚠️ <b>Access Restricted!</b> Pehle channel join karein."
-        await update.message.reply_text(text, reply_markup=get_join_keyboard(), parse_mode="HTML")
+    if not state:
+        await update.message.reply_text(
+            "Kripya menu se option select karein:",
+            reply_markup=get_main_menu(),
+        )
         return
 
-    text = update.message.text.strip()
-    mode = context.user_data.get("mode")
+    if get_user_credits(user_id) <= 0:
+        await update.message.reply_text(
+            "❌ <b>Credits Khatam!</b>\n\n"
+            "Aapka aaj ka limit complete ho chuka hai. Referral link share karke credits add karein.",
+            reply_markup=get_main_menu(),
+            parse_mode="HTML"
+        )
+        USER_STATES[user_id] = None
+        return
 
-    # --- 1. USERNAME TO NUMBER ---
-    if mode == "tg_num" or text.startswith("@") or (not text.isdigit() and len(text) > 3):
-        clean_user = text.lstrip("@").strip()
+    # --- NUM INFO LOOKUP ---
+    if state == "AWAITING_NUM":
+        clean_num = text.replace("+91", "").replace(" ", "").replace("-", "")
+        if not (clean_num.isdigit() and len(clean_num) == 10):
+            await update.message.reply_text(
+                "❌ Kripya sahi 10-digit mobile number enter karein.",
+                reply_markup=get_back_button(),
+            )
+            return
+
+        deduct_credit(user_id)
+        rem_credits = get_user_credits(user_id)
+
+        status_msg = await update.message.reply_text("⏳ <i>Searching details in database...</i>", parse_mode="HTML")
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+
+        try:
+            url = f"https://kallu-api.vercel.app/api?num={clean_num}"
+            res = await http_client.get(url)
+            if res.status_code == 200:
+                data = res.json()
+                if data.get("status") == "success" and "result" in data:
+                    r = data["result"]
+                    reply = (
+                        "📋 <b>DETAILS FOUND:</b>\n"
+                        "━━━━━━━━━━━━━━━━━━━━\n\n"
+                        f"👤 <b>Name:</b> <code>{r.get('name', 'N/A')}</code>\n"
+                        f"📞 <b>Mobile:</b> <code>{r.get('mobile', clean_num)}</code>\n"
+                        f"📱 <b>Alt Mobile:</b> <code>{r.get('alt_mobile', 'N/A')}</code>\n"
+                        f"📍 <b>Circle:</b> <code>{r.get('circle', 'N/A')}</code>\n"
+                        f"🏠 <b>Address:</b> <code>{r.get('address', 'N/A')}</code>\n\n"
+                        f"💳 <i>Remaining Credits: {rem_credits}</i>"
+                        f"{FOOTER_TEXT}"
+                    )
+                else:
+                    reply = f"❌ Number <code>{clean_num}</code> ka data nahi mila.\n💳 <i>Remaining Credits: {rem_credits}</i>{FOOTER_TEXT}"
+            else:
+                reply = f"⚠️ Server response error ({res.status_code}).{FOOTER_TEXT}"
+        except httpx.TimeoutException:
+            reply = f"⏱️ Server Timeout! Database busy hai.{FOOTER_TEXT}"
+        except Exception as e:
+            reply = f"⚠️ Error: {str(e)}{FOOTER_TEXT}"
+
+        USER_STATES[user_id] = None
+        await status_msg.edit_text(reply, reply_markup=get_back_button(), parse_mode="HTML")
+
+    # --- USERNAME TO NUMBER LOOKUP ---
+    elif state == "AWAITING_USERNAME":
+        clean_user = text.replace("@", "").strip()
+
+        deduct_credit(user_id)
+        rem_credits = get_user_credits(user_id)
+
         status_msg = await update.message.reply_text("⏳ <i>Searching username in database...</i>", parse_mode="HTML")
         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
 
-        phone, err = await fetch_tg_num_safe(clean_user)
-
-        if phone:
-            reply = (
-                "🎯 <b>NUMBER FOUND:</b>\n"
-                "━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"🏷 <b>Username:</b> <code>@{clean_user}</code>\n"
-                f"📞 <b>Phone:</b> <code>{phone}</code>\n\n"
-                "<i>Tip: Aap is number ko 'Num Info' me paste karke complete profile check kar sakte hain.</i>\n"
-                f"{FOOTER_TEXT}"
-            )
-        else:
-            if err == "Server Timeout":
-                reply = (
-                    "⏱️ <b>Server Timeout!</b> API server time le raha hai, 1 min baad dubara try karein."
-                    f"{FOOTER_TEXT}"
-                )
+        try:
+            url = f"https://kallu-api.vercel.app/tg?username={clean_user}"
+            res = await http_client.get(url)
+            if res.status_code == 200:
+                data = res.json()
+                if data.get("status") == "success" and "number" in data:
+                    phone = data["number"]
+                    reply = (
+                        "🎯 <b>NUMBER FOUND:</b>\n"
+                        "━━━━━━━━━━━━━━━━━━━━\n\n"
+                        f"🏷 <b>Username:</b> @{clean_user}\n"
+                        f"📞 <b>Phone:</b> <code>{phone}</code>\n\n"
+                        f"💳 <i>Remaining Credits: {rem_credits}</i>"
+                        f"{FOOTER_TEXT}"
+                    )
+                else:
+                    reply = (
+                        f"❌ Username @{clean_user} ka number nahi mila.\n\n"
+                        f"💳 <i>Remaining Credits: {rem_credits}</i>"
+                        f"{FOOTER_TEXT}"
+                    )
             else:
-                extra = f"\n<i>Server Msg: {err}</i>" if err else ""
-                reply = (
-                    f"❌ <b>Username <code>@{clean_user}</code> ka number nahi mila.</b>{extra}\n\n"
-                    "Account private ho sakta hai ya database me updated nahi hai."
-                    f"{FOOTER_TEXT}"
-                )
+                reply = f"⚠️ Server error ({res.status_code}).{FOOTER_TEXT}"
+        except httpx.TimeoutException:
+            reply = f"⏱️ Server Timeout! API response time out ho gaya.{FOOTER_TEXT}"
+        except Exception as e:
+            reply = f"⚠️ Error: {str(e)}{FOOTER_TEXT}"
 
-        menu_btn = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Menu", callback_data="check_join")]])
-        try:
-            await status_msg.edit_text(reply, reply_markup=menu_btn, parse_mode="HTML")
-        except Exception:
-            await update.message.reply_text(reply, reply_markup=menu_btn, parse_mode="HTML")
-        return
+        USER_STATES[user_id] = None
+        await status_msg.edit_text(reply, reply_markup=get_back_button(), parse_mode="HTML")
 
-    # --- 2. NUMBER TO INFO ---
-    digits_only = "".join(filter(str.isdigit, text))
-    if len(digits_only) < 10:
-        await update.message.reply_text("⚠️ Kripya 10-digit mobile number enter karein:", reply_markup=get_main_menu_keyboard())
-        return
-
-    target_number = digits_only[-10:]
-    status_msg = await update.message.reply_text("🔍 <i>Searching details...</i>", parse_mode="HTML")
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
-
-    try:
-        url = f"{API_NUM_INFO}{target_number}"
-        response = await http_client.get(url)
-        formatted_info = None
-
-        try:
-            raw_data = response.json()
-            formatted_info = format_clean_details(raw_data)
-        except Exception:
-            raw_text = response.text.strip()
-            if raw_text and "not found" not in raw_text.lower():
-                formatted_info = raw_text
-
-        if not formatted_info:
-            reply = (
-                f"❌ <b>Is number (<code>{target_number}</code>) ka koi data nahi mila.</b>"
-                f"{FOOTER_TEXT}"
-            )
-        else:
-            reply = f"{formatted_info}\n{FOOTER_TEXT}"
-
-    except (httpx.TimeoutException, httpx.NetworkError):
-        reply = f"⏱️ Request timeout. Thodi der baad try karein.{FOOTER_TEXT}"
-    except Exception as e:
-        reply = f"❌ Error: <code>{str(e)}</code>{FOOTER_TEXT}"
-
-    menu_btn = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Menu", callback_data="check_join")]])
-    try:
-        await status_msg.edit_text(reply, reply_markup=menu_btn, parse_mode="HTML")
-    except Exception:
-        await update.message.reply_text(reply, reply_markup=menu_btn, parse_mode="HTML")
-
-# --- RENDER DUMMY WEB SERVER ---
+# --- RENDER WEB SERVER ---
 async def handle_health_check(request):
-    return web.Response(text="Bot is running active 24/7!")
+    return web.Response(text="Info Bot 24/7 is active!")
 
 async def start_web_server():
     server = web.Application()
@@ -509,7 +365,6 @@ async def start_web_server():
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
 
-# --- KEEP-ALIVE SELF PINGER ---
 async def keep_alive_ping():
     render_url = os.environ.get("RENDER_EXTERNAL_URL")
     if not render_url:
@@ -518,9 +373,8 @@ async def keep_alive_ping():
         await asyncio.sleep(600)
         try:
             await http_client.get(render_url)
-            logging.info("Keep-alive ping success!")
-        except Exception as e:
-            logging.warning(f"Self-ping failed: {e}")
+        except Exception:
+            pass
 
 async def main():
     await start_web_server()
@@ -529,15 +383,14 @@ async def main():
     app = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
-        .connect_timeout(45.0)
-        .read_timeout(45.0)
-        .write_timeout(45.0)
+        .connect_timeout(30.0)
+        .read_timeout(30.0)
+        .write_timeout(30.0)
         .build()
     )
+
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("myid", myid))
-    app.add_handler(CommandHandler("broadcast", broadcast))
-    app.add_handler(CallbackQueryHandler(handle_callback))
+    app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
 
     await app.initialize()
